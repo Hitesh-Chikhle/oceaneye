@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large datasets
+data/
+datasets/
+
+# Satellite imagery
+*.tif
+*.tiff
+*.zip
+
+# AI models
+*.pth
+*.pt
+*.h5
+*.onnx
+
+# Node
+node_modules/
+
+# OS/editor
+.DS_Store
+.vscode/
