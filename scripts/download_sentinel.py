@@ -1,22 +1,20 @@
+"""
+OceanEye - Sentinel-1 SAR Imagery Ingestion Connector
+Searches and downloads Sentinel-1 IW GRD products from Copernicus Data Space Ecosystem (CDSE).
+"""
+
 import argparse
 import os
 import sys
 from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
-
-
-# ---------------------------------------------------------
-# Project paths
-# ---------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_FILE = PROJECT_ROOT / ".env"
-EVENTS_FILE = PROJECT_ROOT / "config" / "events.json"
-
-DATA_DIR = PROJECT_ROOT / "data" / "sentinel"
-
+from common import (
+    check_existing_file,
+    create_retry_session,
+    get_data_dir,
+    get_event,
+    setup_logging,
+)
 
 # ---------------------------------------------------------
 # CDSE API endpoints
@@ -39,27 +37,20 @@ DOWNLOAD_URL = (
 
 
 # ---------------------------------------------------------
-# Load environment
-# ---------------------------------------------------------
-
-load_dotenv(ENV_FILE)
-
-
-# ---------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------
 
-def get_access_token():
+def get_access_token(session=None, logger=None):
     """Get a CDSE access token using credentials from .env."""
+    if not logger:
+        logger = setup_logging("download_sentinel")
 
     email = os.getenv("CDSE_EMAIL")
     password = os.getenv("CDSE_PASSWORD")
 
-    if not email:
-        raise RuntimeError("CDSE_EMAIL is missing from .env")
-
-    if not password:
-        raise RuntimeError("CDSE_PASSWORD is missing from .env")
+    if not email or not password:
+        logger.error("Missing CDSE credentials in .env (CDSE_EMAIL, CDSE_PASSWORD).")
+        raise RuntimeError("CDSE_EMAIL and CDSE_PASSWORD must be configured in .env")
 
     data = {
         "client_id": "cdse-public",
@@ -68,15 +59,18 @@ def get_access_token():
         "grant_type": "password",
     }
 
-    print("Requesting CDSE access token...")
+    logger.info("Requesting CDSE access token...")
 
-    response = requests.post(
+    http = session or create_retry_session()
+
+    response = http.post(
         TOKEN_URL,
         data=data,
         timeout=60,
     )
 
     if response.status_code != 200:
+        logger.error("CDSE authentication failed with HTTP %d: %s", response.status_code, response.text[:500])
         raise RuntimeError(
             f"CDSE authentication failed: "
             f"{response.status_code}\n"
@@ -84,33 +78,14 @@ def get_access_token():
         )
 
     result = response.json()
-
     token = result.get("access_token")
 
     if not token:
+        logger.error("CDSE response did not contain an access token.")
         raise RuntimeError("CDSE response did not contain an access token.")
 
-    print("CDSE authentication successful.")
-
+    logger.info("CDSE authentication successful.")
     return token
-
-
-# ---------------------------------------------------------
-# Event loading
-# ---------------------------------------------------------
-
-def load_events():
-    """Load spill events from config/events.json."""
-
-    import json
-
-    if not EVENTS_FILE.exists():
-        raise FileNotFoundError(
-            f"Events file not found: {EVENTS_FILE}"
-        )
-
-    with open(EVENTS_FILE, "r", encoding="utf-8") as file:
-        return json.load(file)
 
 
 # ---------------------------------------------------------
@@ -118,11 +93,13 @@ def load_events():
 # ---------------------------------------------------------
 
 def search_sentinel(
-    latitude,
-    longitude,
-    start_date,
-    end_date,
-    top=10,
+    latitude: float,
+    longitude: float,
+    start_date: str,
+    end_date: str,
+    top: int = 10,
+    session=None,
+    logger=None,
 ):
     """
     Search Sentinel-1 IW GRD products around an event.
@@ -133,6 +110,8 @@ def search_sentinel(
     because OData expects:
         POINT(longitude latitude)
     """
+    if not logger:
+        logger = setup_logging("download_sentinel")
 
     filters = (
         "Collection/Name eq 'SENTINEL-1' "
@@ -157,26 +136,35 @@ def search_sentinel(
     }
 
     print()
-    print("Searching Sentinel-1 products...")
+    print("=" * 80)
+    print("OCEANEYE - SENTINEL-1 PRODUCT SEARCH")
+    print("=" * 80)
     print(f"Location : {latitude}, {longitude}")
-    print(f"Dates    : {start_date} → {end_date}")
+    print(f"Dates    : {start_date} -> {end_date}")
     print("Product  : IW_GRDH_1S")
+    print("=" * 80)
     print()
 
-    response = requests.get(
+    logger.info("Searching Sentinel-1 products via CDSE catalogue API...")
+    http = session or create_retry_session()
+
+    response = http.get(
         CATALOGUE_URL,
         params=params,
         timeout=60,
     )
 
     if response.status_code != 200:
+        logger.error("Sentinel-1 search failed with HTTP %d: %s", response.status_code, response.text[:1000])
         raise RuntimeError(
             f"Sentinel-1 search failed: "
             f"{response.status_code}\n"
             f"{response.text[:1000]}"
         )
 
-    return response.json().get("value", [])
+    products = response.json().get("value", [])
+    logger.info("Found %d Sentinel-1 product(s).", len(products))
+    return products
 
 
 # ---------------------------------------------------------
@@ -185,7 +173,6 @@ def search_sentinel(
 
 def print_products(products):
     """Display useful information about search results."""
-
     if not products:
         print("No Sentinel-1 products found.")
         return
@@ -195,7 +182,6 @@ def print_products(products):
     print("=" * 80)
 
     for index, product in enumerate(products, start=1):
-
         product_id = product.get("Id")
         name = product.get("Name")
         size = product.get("ContentLength")
@@ -224,29 +210,31 @@ def print_products(products):
 # Download
 # ---------------------------------------------------------
 
-def download_product(product, token, output_dir):
+def download_product(
+    product: dict,
+    token: str,
+    output_dir: Path,
+    overwrite: bool = False,
+    session=None,
+    logger=None,
+):
     """Download one Sentinel-1 product."""
+    if not logger:
+        logger = setup_logging("download_sentinel")
 
     product_id = product["Id"]
     product_name = product["Name"]
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # CDSE may return the native product content.
-    # We keep the catalogue product name as the output name.
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / product_name
 
-    if output_file.exists():
-        print()
-        print(f"Already exists:")
-        print(output_file)
+    # Check existing file safety
+    if check_existing_file(output_file, overwrite=overwrite, logger=logger):
+        print(f"File already exists: {output_file}")
+        print("Skipping download. Use --overwrite to re-download.")
         return output_file
 
     url = f"{DOWNLOAD_URL}({product_id})/$value"
-
     headers = {
         "Authorization": f"Bearer {token}",
     }
@@ -258,9 +246,13 @@ def download_product(product, token, output_dir):
     print(f"Product : {product_name}")
     print(f"ID      : {product_id}")
     print(f"Output  : {output_file}")
+    print("=" * 80)
     print()
 
-    response = requests.get(
+    logger.info("Initiating download for product ID: %s", product_id)
+    http = session or create_retry_session()
+
+    response = http.get(
         url,
         headers=headers,
         stream=True,
@@ -268,22 +260,18 @@ def download_product(product, token, output_dir):
     )
 
     if response.status_code != 200:
+        logger.error("Download failed with HTTP %d: %s", response.status_code, response.text[:1000])
         raise RuntimeError(
             f"Download failed: {response.status_code}\n"
             f"{response.text[:1000]}"
         )
 
     total = int(response.headers.get("Content-Length", 0))
-
     downloaded = 0
     chunk_size = 1024 * 1024
 
     with open(output_file, "wb") as file:
-
-        for chunk in response.iter_content(
-            chunk_size=chunk_size
-        ):
-
+        for chunk in response.iter_content(chunk_size=chunk_size):
             if not chunk:
                 continue
 
@@ -294,38 +282,31 @@ def download_product(product, token, output_dir):
                 percent = downloaded * 100 / total
                 downloaded_gb = downloaded / (1024 ** 3)
                 total_gb = total / (1024 ** 3)
-
                 print(
-                    f"\rDownloaded: "
-                    f"{downloaded_gb:.2f}/{total_gb:.2f} GB "
-                    f"({percent:.1f}%)",
+                    f"\rDownloaded: {downloaded_gb:.2f}/{total_gb:.2f} GB ({percent:.1f}%)",
                     end="",
                     flush=True,
                 )
             else:
                 downloaded_gb = downloaded / (1024 ** 3)
-
                 print(
-                    f"\rDownloaded: "
-                    f"{downloaded_gb:.2f} GB",
+                    f"\rDownloaded: {downloaded_gb:.2f} GB",
                     end="",
                     flush=True,
                 )
 
     print()
     print()
-    print("Download completed.")
+    logger.info("Download completed successfully.")
     print(f"Saved to: {output_file}")
-
     return output_file
 
 
 # ---------------------------------------------------------
-# Main
+# CLI Entry Point
 # ---------------------------------------------------------
 
 def main():
-
     parser = argparse.ArgumentParser(
         description="Search and download Sentinel-1 data from CDSE."
     )
@@ -333,43 +314,42 @@ def main():
     parser.add_argument(
         "--event",
         default="wakashio",
-        help="Event name from config/events.json",
+        help="Event name from config/events.json (default: wakashio)",
     )
 
     parser.add_argument(
         "--top",
         type=int,
         default=10,
-        help="Maximum number of products to show",
+        help="Maximum number of products to show (default: 10)",
     )
 
     parser.add_argument(
         "--download",
         type=int,
-        help=(
-            "Download product by result number. "
-            "Example: --download 1"
-        ),
+        help="Download product by result index (e.g. --download 1)",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output files if they already exist",
+    )
+
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
     )
 
     args = parser.parse_args()
 
-    events = load_events()
+    # Configure logging
+    logger = setup_logging("download_sentinel", args.log_level)
 
-    if args.event not in events:
-        print(
-            f"Unknown event: {args.event}"
-        )
-        print(
-            "Available events:"
-        )
-
-        for name in events:
-            print(f"  - {name}")
-
-        sys.exit(1)
-
-    event = events[args.event]
+    # Validate and load event configuration (exits cleanly on invalid event)
+    event = get_event(args.event)
 
     latitude = event["latitude"]
     longitude = event["longitude"]
@@ -380,8 +360,10 @@ def main():
     print("=" * 80)
     print("OCEANEYE - SENTINEL-1 INGESTION")
     print("=" * 80)
-    print(f"Event: {event['name']}")
+    print(f"Event: {event['name']} ({args.event})")
     print("=" * 80)
+
+    session = create_retry_session()
 
     products = search_sentinel(
         latitude=latitude,
@@ -389,6 +371,8 @@ def main():
         start_date=start_date,
         end_date=end_date,
         top=args.top,
+        session=session,
+        logger=logger,
     )
 
     print_products(products)
@@ -398,7 +382,6 @@ def main():
 
     # Search-only mode
     if args.download is None:
-        print()
         print("Search complete.")
         print()
         print("To download a product, use:")
@@ -408,23 +391,23 @@ def main():
         )
         return
 
-    # Validate selected result
+    # Validate selected result index
     index = args.download - 1
-
     if index < 0 or index >= len(products):
-        raise ValueError(
-            f"Invalid product number: {args.download}"
-        )
+        print(f"Error: Invalid product number {args.download}. Must be between 1 and {len(products)}.", file=sys.stderr)
+        sys.exit(1)
 
     # Authentication only when actually downloading
-    token = get_access_token()
-
-    event_dir = DATA_DIR / args.event
+    token = get_access_token(session=session, logger=logger)
+    event_dir = get_data_dir("sentinel", args.event)
 
     download_product(
         product=products[index],
         token=token,
         output_dir=event_dir,
+        overwrite=args.overwrite,
+        session=session,
+        logger=logger,
     )
 
 
