@@ -84,3 +84,46 @@ Trained checkpoints and standardized metadata are written to `models/`:
 - `models/segmentation/sar_unet_weights.pt` & `segmentation_metadata.json`
 - `models/classification/sar_lookalike_classifier.json` & `classification_metadata.json`
 - `models/ranking/vessel_ranking_model.json` & `ranking_metadata.json`
+
+---
+
+## Phase 4: Drift & Attribution Pipeline (`scripts/drift/`)
+
+Phase 4 connects satellite detections with ocean physics to forecast slick movement and back-trace candidate spill sources:
+
+1. **Lagrangian Transport Model**:
+   $$\vec{v}_{\text{particle}} = \vec{v}_{\text{current}} + c_w \cdot \vec{v}_{\text{wind}}$$
+   where $\vec{v}_{\text{current}}$ is ocean surface current $(u_o, v_o)$, $\vec{v}_{\text{wind}}$ is 10m wind vector $(u_{10}, v_{10})$, and $c_w \approx 0.03$ (3% leeway factor).
+
+2. **Forward & Backward Trajectory Simulation**:
+   - **Forward Drift**: Forecasts slick dispersion over $+24$ to $+72$ hours.
+   - **Backward Drift**: Backtracks slick motion over $-48$ hours to delineate an **estimated possible source region**.
+
+3. **Monte Carlo Particle Ensemble**:
+   - Perturbs initial position ($\sigma \sim 300\text{ m}$) and windage leeway ($c_w \sim \mathcal{N}(0.03, 0.005)$).
+   - Generates empirical 95% dispersion radius, bounding box, and convex hull polygon.
+
+4. **AIS Track Correlation & Phase 3 Scoring**:
+   - Correlates vessel AIS tracks with the backward drift trajectory and estimated source region.
+   - Extracts trajectory proximity, temporal offset, speed anomalies, and drift-corrected distance.
+   - Scores candidate vessels using the Phase 3 XGBoost attribution model.
+
+### Phase 4 CLI Usage
+```bash
+# Execute end-to-end drift and vessel attribution
+python scripts/run_drift_attribution.py --event wakashio
+
+# Custom simulation parameters
+python scripts/run_drift_attribution.py --event wakashio --forward-hours 48 --backward-hours 72 --particles 50
+```
+
+### Phase 4 Output Artifacts
+Structured data outputs are written to `data/drift/` and `data/attribution/`:
+- `data/drift/<event>/processed/forward_trajectory.csv`
+- `data/drift/<event>/processed/backward_trajectory.csv`
+- `data/drift/<event>/processed/ensemble_trajectories.csv`
+- `data/drift/<event>/processed/source_region.json`
+- `data/drift/<event>/processed/drift_metadata.json`
+- `data/attribution/<event>/processed/vessel_features.csv`
+- `data/attribution/<event>/processed/vessel_candidates.json`
+- `data/attribution/<event>/processed/attribution_metadata.json`
