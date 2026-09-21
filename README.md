@@ -127,3 +127,125 @@ Structured data outputs are written to `data/drift/` and `data/attribution/`:
 - `data/attribution/<event>/processed/vessel_features.csv`
 - `data/attribution/<event>/processed/vessel_candidates.json`
 - `data/attribution/<event>/processed/attribution_metadata.json`
+
+---
+
+## Phase 5: FastAPI Backend & Orchestration Service (`api/`)
+
+Phase 5 exposes the OceanEye intelligence pipeline through high-performance REST and GeoJSON endpoints, powering the evidence dashboard frontend.
+
+### Architecture
+
+```
+api/
+├── main.py                  # Application entry point, CORS, and global error handlers
+├── config.py                # Operational settings, safety thresholds, and legal disclaimers
+├── dependencies.py          # Shared dependencies and structured logger
+├── schemas/                 # Pydantic validation models
+│   ├── common.py            # GeoJSON geometries, status, and health models
+│   ├── events.py            # Event summaries and detail models
+│   ├── detection.py         # Sentinel-1 SAR metadata and detection models
+│   ├── drift.py             # Trajectory, polygon, and simulation schemas
+│   └── attribution.py       # Ranked vessel candidate models
+├── routes/                  # Modular endpoint routers
+│   ├── root.py              # GET / and GET /health
+│   ├── events.py            # GET /api/events, GET /api/events/{event_id}
+│   ├── detection.py         # GET /api/events/{event_id}/detection
+│   ├── drift.py             # GET /api/events/{event_id}/drift, POST /api/drift/simulate
+│   └── attribution.py       # GET /api/events/{event_id}/attribution
+├── services/                # Business logic and data layer
+│   ├── event_service.py     # Dynamic event resolution
+│   ├── detection_service.py # Sentinel metadata & strict null geometry enforcement
+│   ├── drift_service.py     # Stored outputs and on-demand Lagrangian simulations
+│   └── attribution_service.py # Suspect vessel prioritization retrieval
+└── utils/
+    └── geojson.py           # RFC 7946 GeoJSON converters ([lon, lat] coordinate ordering)
+```
+
+### Installation & Server Execution
+
+1. **Install Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Start FastAPI Development Server**:
+   ```bash
+   uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+   ```
+
+3. **Interactive OpenAPI / Swagger Documentation**:
+   - Swagger UI: `http://127.0.0.1:8000/docs`
+   - ReDoc UI: `http://127.0.0.1:8000/redoc`
+
+### API Endpoints
+
+| Method | Endpoint | Description | Key Response Fields |
+|---|---|---|---|
+| `GET` | `/` | System landing & service status | `status`, `app_name`, `version`, `docs_url` |
+| `GET` | `/health` | Health check endpoint | `status`, `version`, `timestamp` |
+| `GET` | `/api/events` | List all configured incidents | `event_id`, `name`, `latitude`, `longitude`, `radius_km` |
+| `GET` | `/api/events/{event_id}` | Event details & data availability | `bounding_box`, `data_availability` |
+| `GET` | `/api/events/{event_id}/detection` | Sentinel-1 SAR metadata & detection | `geometry: null`, `footprint_polygon`, `platform`, `sensor_mode` |
+| `GET` | `/api/events/{event_id}/drift` | Stored forward/backward trajectories & source region | GeoJSON `LineString` & `Polygon` features (`[lon, lat]`) |
+| `GET` | `/api/events/{event_id}/attribution` | Suspect vessel prioritization ranks | Ranked candidates, `responsibility_confirmed: false`, features |
+| `POST` | `/api/drift/simulate` | On-demand Lagrangian drift simulation | Forward/backward GeoJSON `LineString`, source `Polygon` |
+
+### Example Requests & Responses
+
+#### 1. On-Demand Drift Simulation (`POST /api/drift/simulate`)
+```bash
+curl -X POST http://127.0.0.1:8000/api/drift/simulate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "latitude": -19.79856,
+    "longitude": 57.88786,
+    "timestamp": "2020-08-10T01:37:55Z",
+    "forward_duration_hours": 12.0,
+    "backward_duration_hours": 12.0,
+    "timestep_seconds": 1800,
+    "windage": 0.03,
+    "particle_count": 10,
+    "event_id": "wakashio"
+  }'
+```
+
+**Response**:
+```json
+{
+  "is_simulation": true,
+  "simulation_type": "on_demand_simulation",
+  "forward_trajectory": {
+    "type": "Feature",
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[57.88786, -19.79856], [57.87113, -19.7858]]
+    },
+    "properties": {"steps": 25, "duration_hours": 12.0}
+  },
+  "backward_trajectory": {
+    "type": "Feature",
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[57.88786, -19.79856], [57.9039, -19.8118]]
+    }
+  },
+  "source_region": {
+    "type": "Feature",
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [[[57.9659, -19.8844], [57.9857, -19.8922], [57.9659, -19.8844]]]
+    }
+  },
+  "summary": {
+    "dispersion_radius_95_km": 1.24
+  }
+}
+```
+
+### Operational Limitations & Legal Notice
+
+> [!IMPORTANT]
+> - **Detection Geometry Contract**: In the current version, satellite scene footprint bounds indicate sensor image boundaries and do not constitute a pixel-level oil slick segmentation. The detection endpoint strictly returns `geometry: null` until verified pixel segmentation is generated.
+> - **Prioritization Is Not Proof of Responsibility**: All prioritization scores represent statistical spatio-temporal and kinematic correlations. Candidate ranks and scores **DO NOT** constitute legal proof, evidence of liability, or confirmation of oil discharge.
+> - **Synthetic Benchmark Notice**: When real AIS or labeled SAR training annotations are unavailable, the pipeline operates in synthetic benchmark mode for pipeline verification.
