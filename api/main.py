@@ -16,7 +16,7 @@ from api.config import (
     CORS_ALLOWED_ORIGINS,
 )
 from api.dependencies import get_logger
-from api.routes import attribution, detection, drift, events, root
+from api.routes import attribution, detection, drift, events, ops, root
 
 logger = get_logger()
 
@@ -80,3 +80,4 @@ app.include_router(events.router)
 app.include_router(detection.router)
 app.include_router(drift.router)
 app.include_router(attribution.router)
+app.include_router(ops.router)
